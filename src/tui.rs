@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -118,17 +118,24 @@ fn handle_normal(app: &mut App, key: KeyCode) {
 }
 
 fn handle_editing(app: &mut App, key: KeyCode) {
+    // Enter/Esc change the app's mode, so they need &mut App; everything else is
+    // pure text editing, scoped to a borrow of the EditState.
     match key {
-        KeyCode::Char(c)   => app.edit_insert(c),
-        KeyCode::Backspace => app.edit_backspace(),
-        KeyCode::Delete    => app.edit_delete(),
-        KeyCode::Left      => app.edit_cursor_left(),
-        KeyCode::Right     => app.edit_cursor_right(),
-        KeyCode::Home      => app.edit_cursor_home(),
-        KeyCode::End       => app.edit_cursor_end(),
-        KeyCode::Enter     => app.confirm_edit(),
-        KeyCode::Esc       => app.cancel_edit(),
-        _ => {}
+        KeyCode::Enter => app.confirm_edit(),
+        KeyCode::Esc   => app.cancel_edit(),
+        other => {
+            let Some(s) = app.editing_mut() else { return };
+            match other {
+                KeyCode::Char(c)   => s.insert(c),
+                KeyCode::Backspace => s.backspace(),
+                KeyCode::Delete    => s.delete(),
+                KeyCode::Left      => s.cursor_left(),
+                KeyCode::Right     => s.cursor_right(),
+                KeyCode::Home      => s.cursor_home(),
+                KeyCode::End       => s.cursor_end(),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -251,10 +258,7 @@ fn file_item(app: &App, ei: usize, width: usize, indented: bool) -> ListItem<'st
         status_color = Color::Red;
     }
 
-    let filename = entry.sort.file.path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let filename = base_name(&entry.sort.file.path);
 
     let indent = if indented { "    " } else { "" };
     let reserve = if indented { 16 } else { 40 };
@@ -270,14 +274,7 @@ fn file_item(app: &App, ei: usize, width: usize, indented: bool) -> ListItem<'st
             spans.push(Span::styled(format!("  ep.{}", ep), Style::default().fg(Color::DarkGray)));
         }
     } else {
-        let (dest_str, dest_color) = match entry.effective_destination() {
-            Destination::Existing(p) => (
-                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                Color::Green,
-            ),
-            Destination::New(name) => (format!("[NEW] {}/", name), Color::Yellow),
-            Destination::Unresolved => ("UNRESOLVED".to_string(), Color::Red),
-        };
+        let (dest_str, dest_color) = dest_display(entry.effective_destination());
         let source_label = entry.sort.source.as_ref().map(|s| s.label()).unwrap_or("?");
         spans.push(Span::raw(" → "));
         spans.push(Span::styled(dest_str, Style::default().fg(dest_color)));
@@ -290,14 +287,7 @@ fn file_item(app: &App, ei: usize, width: usize, indented: bool) -> ListItem<'st
 /// The destination a whole group resolves to (its files all share one).
 fn group_destination(app: &App, gi: usize) -> (String, Color) {
     let ei = app.groups[gi].entry_indices[0];
-    match app.entries[ei].effective_destination() {
-        Destination::Existing(p) => (
-            p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            Color::Green,
-        ),
-        Destination::New(name) => (format!("[NEW] {}/", name), Color::Yellow),
-        Destination::Unresolved => ("UNRESOLVED".to_string(), Color::Red),
-    }
+    dest_display(app.entries[ei].effective_destination())
 }
 
 /// Char-safe truncation with an ellipsis (filenames can contain Japanese etc.,
@@ -380,11 +370,7 @@ fn file_detail_lines(app: &App, ei: usize) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("file:    ", dim),
-            Span::raw(
-                file.path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ),
+            Span::raw(base_name(&file.path)),
         ]),
         Line::from(vec![
             Span::styled("parsed:  ", dim),
@@ -538,6 +524,21 @@ fn draw_confirm_overlay(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Final component of a path as an owned String (a folder or file name).
+fn base_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Render a destination as a colored label for the list and group-header views.
+/// (The detail panel shows the full path instead, so it doesn't use this.)
+fn dest_display(dest: &Destination) -> (String, Color) {
+    match dest {
+        Destination::Existing(p) => (base_name(p), Color::Green),
+        Destination::New(name)   => (format!("[NEW] {}/", name), Color::Yellow),
+        Destination::Unresolved  => ("UNRESOLVED".to_string(), Color::Red),
+    }
+}
 
 /// Split `text` into (before_cursor, char_at_cursor, after_cursor).
 /// If the cursor is past the end, `char_at_cursor` is a space (block cursor).

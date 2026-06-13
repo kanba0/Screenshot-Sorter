@@ -188,7 +188,7 @@ pub fn run_pipeline(
         let series_key = al_entry
             .as_ref()
             .map(|al| SeriesKey::AniListId(al.id))
-            .or_else(|| Some(SeriesKey::NormalizedTitle(key)));
+            .or(Some(SeriesKey::NormalizedTitle(key)));
 
         for file in files {
             entries.push(SortEntry {

@@ -44,6 +44,50 @@ pub struct EditState {
     pub cursor: usize, // char index, not byte index
 }
 
+impl EditState {
+    /// Insert a char at the cursor and step past it. `cursor` is a *char* index,
+    /// so we translate to a byte offset before touching the UTF-8 `String` —
+    /// the whole reason this logic lives here, next to the invariant it guards.
+    pub fn insert(&mut self, c: char) {
+        let byte = char_to_byte(&self.text, self.cursor);
+        self.text.insert(byte, c);
+        self.cursor += 1;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte = char_to_byte(&self.text, self.cursor);
+            self.text.remove(byte);
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            let byte = char_to_byte(&self.text, self.cursor);
+            self.text.remove(byte);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.text.chars().count();
+    }
+}
+
 // ── App mode ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,8 +222,17 @@ impl App {
         rows
     }
 
+    /// Row count without materializing the rows — mirrors `visible_rows`: a
+    /// one-file group is a single row; a multi-file group is its header plus,
+    /// when expanded, one row per file. Cheap enough to call on every keypress.
     pub fn visible_len(&self) -> usize {
-        self.visible_rows().len()
+        self.groups
+            .iter()
+            .map(|g| match g.entry_indices.len() {
+                1 => 1,
+                n => if g.expanded { 1 + n } else { 1 },
+            })
+            .sum()
     }
 
     pub fn selected_row(&self) -> Option<Row> {
@@ -323,59 +376,12 @@ impl App {
         self.mode = Mode::Editing(EditState { entry_idx: idx, text: current, cursor });
     }
 
-    pub fn edit_insert(&mut self, c: char) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            let byte = char_to_byte(&s.text, s.cursor);
-            s.text.insert(byte, c);
-            s.cursor += 1;
-        }
-    }
-
-    pub fn edit_backspace(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            if s.cursor > 0 {
-                s.cursor -= 1;
-                let byte = char_to_byte(&s.text, s.cursor);
-                s.text.remove(byte);
-            }
-        }
-    }
-
-    pub fn edit_delete(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            let len = s.text.chars().count();
-            if s.cursor < len {
-                let byte = char_to_byte(&s.text, s.cursor);
-                s.text.remove(byte);
-            }
-        }
-    }
-
-    pub fn edit_cursor_left(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            if s.cursor > 0 {
-                s.cursor -= 1;
-            }
-        }
-    }
-
-    pub fn edit_cursor_right(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            if s.cursor < s.text.chars().count() {
-                s.cursor += 1;
-            }
-        }
-    }
-
-    pub fn edit_cursor_home(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            s.cursor = 0;
-        }
-    }
-
-    pub fn edit_cursor_end(&mut self) {
-        if let Mode::Editing(ref mut s) = self.mode {
-            s.cursor = s.text.chars().count();
+    /// Mutable handle on the in-progress edit, or `None` if we're not editing.
+    /// The key handler drives the cursor through `EditState`'s own methods.
+    pub fn editing_mut(&mut self) -> Option<&mut EditState> {
+        match &mut self.mode {
+            Mode::Editing(s) => Some(s),
+            _ => None,
         }
     }
 
