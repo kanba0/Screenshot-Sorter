@@ -140,11 +140,13 @@ pub fn run_pipeline(
     }
 
     for (i, (key, title)) in needs_anilist.iter().enumerate() {
+        let from_cache = anilist.is_cached(title);
         eprint!("  [{}/{}] {}... ", i + 1, needs_anilist.len(), title);
 
         let al_entry = match anilist.search(title) {
             Ok(r) => {
-                eprintln!("{}", r.as_ref().and_then(|r| r.romaji.as_deref()).unwrap_or("not found"));
+                let name = r.as_ref().and_then(|r| r.romaji.as_deref()).unwrap_or("not found");
+                if from_cache { eprintln!("{} (cached)", name); } else { eprintln!("{}", name); }
                 r
             }
             Err(e) => { eprintln!("error: {}", e); None }
@@ -168,7 +170,9 @@ pub fn run_pipeline(
 
         resolved.insert(key.clone(), (destination, source, al_entry));
 
-        if i + 1 < needs_anilist.len() {
+        // Only pause for the rate limit when we actually hit the network —
+        // cache hits cost nothing, so they shouldn't slow the batch down.
+        if !from_cache && i + 1 < needs_anilist.len() {
             std::thread::sleep(std::time::Duration::from_millis(ANILIST_DELAY_MS));
         }
     }

@@ -38,8 +38,13 @@ compilation movies with non-latin titles
 - release groups with unusual tag conventions
 
 ## anilist improvements
-- **file-based cache** — don't re-query titles looked up in previous runs
-  (saves time + avoids the 90req/min rate limit on big batches)
+- **file-based cache — DONE** — successful lookups persist to a cache file under
+  the user cache dir and are reloaded on the next run, so previously-resolved
+  titles cost no network call. only *hits* are cached: a "not found" is usually
+  our own parse miss, so re-querying it lets a later fix recover. written on
+  `Drop`, gracefully degrades to in-memory if the cache dir/file is unusable.
+  the rate-limit sleep now only fires for real network calls, and cache hits are
+  tagged in the output so it's visibly working.
 - **retry with stripped title** — if search fails, try removing part/cour markers
   ("Part 2", "Cour 2", "The Movie") and retry before giving up
 - **more season formats** — SEASON_SUFFIX currently only strips `S\d+`,

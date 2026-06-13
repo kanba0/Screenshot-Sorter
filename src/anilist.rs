@@ -1,13 +1,14 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const ANILIST_URL: &str = "https://graphql.anilist.co";
 const TIMEOUT_SECS: u64 = 15;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AniListEntry {
     pub id: u32,
     pub romaji: Option<String>,
@@ -75,19 +76,33 @@ struct GqlTitle {
 
 pub struct AniListClient {
     client: reqwest::blocking::Client,
-    /// Cache keyed by lowercased query string
+    /// Cache keyed by lowercased query string. `None` = "AniList found nothing"
+    /// (kept only for the current run; never persisted — see `save`).
     cache: HashMap<String, Option<AniListEntry>>,
+    /// Where the on-disk cache lives. `None` if we couldn't resolve a cache dir,
+    /// in which case caching silently degrades to in-memory only.
+    path: Option<PathBuf>,
 }
 
 impl AniListClient {
     pub fn new() -> Self {
+        let path = cache_path();
+        // Warm the in-memory cache with anything we found in previous runs.
+        let cache = path.as_deref().map(load_cache).unwrap_or_default();
         Self {
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(TIMEOUT_SECS))
                 .build()
                 .expect("failed to build HTTP client"),
-            cache: HashMap::new(),
+            cache,
+            path,
         }
+    }
+
+    /// Whether `title` is already in the cache (from disk or this run), so the
+    /// caller can skip the rate-limit sleep and the "querying" UI for a hit.
+    pub fn is_cached(&self, title: &str) -> bool {
+        self.cache.contains_key(&title.to_lowercase())
     }
 
     pub fn search(&mut self, title: &str) -> Result<Option<AniListEntry>> {
@@ -139,4 +154,63 @@ impl AniListClient {
             synonyms: m.synonyms,
         }))
     }
+
+    /// Write the successful lookups back to disk. Negative results (`None`) are
+    /// deliberately dropped: a "not found" is usually our own parse miss, and we
+    /// don't want to freeze that mistake into the cache.
+    fn save(&self) -> Result<()> {
+        let Some(path) = &self.path else { return Ok(()); };
+
+        // Borrow the hits straight out of the map — no cloning needed, serde is
+        // happy to serialize through references.
+        let hits: HashMap<&String, &AniListEntry> = self
+            .cache
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|entry| (k, entry)))
+            .collect();
+        if hits.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating cache dir {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(&hits)?;
+        std::fs::write(path, json).with_context(|| format!("writing cache {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Flush the cache when the client goes out of scope. `Drop` is Rust's RAII
+/// hook (like a C++ destructor) — but it can't return a `Result` or take args,
+/// so any failure has to be handled right here rather than propagated.
+impl Drop for AniListClient {
+    fn drop(&mut self) {
+        if let Err(e) = self.save() {
+            eprintln!("  warning: couldn't write AniList cache: {e}");
+        }
+    }
+}
+
+/// `$XDG_CACHE_HOME/ssort/anilist.json`, falling back to `~/.cache/...`.
+/// Returns `None` if we can't even find a home dir, disabling disk caching.
+fn cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("ssort").join("anilist.json"))
+}
+
+/// Load the persisted hits into the in-memory shape (`Some(entry)`). Any
+/// problem — missing file, corrupt json — just yields an empty cache so a bad
+/// file can never crash the run; worst case we start cold.
+fn load_cache(path: &Path) -> HashMap<String, Option<AniListEntry>> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    let Ok(stored) = serde_json::from_slice::<HashMap<String, AniListEntry>>(&bytes) else {
+        return HashMap::new();
+    };
+    stored.into_iter().map(|(k, v)| (k, Some(v))).collect()
 }
