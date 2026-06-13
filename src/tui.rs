@@ -17,12 +17,18 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, EditState, EntryStatus, Mode};
+use crate::app::{App, EditState, EntryStatus, Mode, Row};
 use crate::matching::{Destination, SortEntry};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn run(entries: Vec<SortEntry>, dest_root: PathBuf) -> Result<()> {
+/// What the review session left unsorted, for the closing summary.
+pub struct RunSummary {
+    pub skipped: usize,
+    pub pending: usize,
+}
+
+pub fn run(entries: Vec<SortEntry>, dest_root: PathBuf) -> Result<RunSummary> {
     let mut app = App::new(entries, dest_root);
 
     enable_raw_mode()?;
@@ -41,11 +47,14 @@ pub fn run(entries: Vec<SortEntry>, dest_root: PathBuf) -> Result<()> {
 
     run_result?;
 
-    if let Some(msg) = app.message {
+    if let Some(msg) = &app.message {
         println!("{}", msg);
     }
 
-    Ok(())
+    Ok(RunSummary {
+        skipped: app.skipped_count(),
+        pending: app.pending_count(),
+    })
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────────
@@ -95,6 +104,9 @@ fn handle_normal(app: &mut App, key: KeyCode) {
         KeyCode::PageDown                  => app.page_down(10),
         KeyCode::Char('g')                 => app.jump_top(),
         KeyCode::Char('G')                 => app.jump_bottom(),
+        KeyCode::Right | KeyCode::Char('l') => app.expand_selected(),
+        KeyCode::Left  | KeyCode::Char('h') => app.collapse_selected(),
+        KeyCode::Char(' ')                 => app.toggle_selected(),
         KeyCode::Enter | KeyCode::Char('a') => app.approve_selected(),
         KeyCode::Char('A')                 => app.approve_all_ready(),
         KeyCode::Char('s')                 => app.skip_selected(),
@@ -167,57 +179,19 @@ fn draw(f: &mut Frame, app: &App, list_state: &mut ListState) {
 }
 
 fn draw_list(f: &mut Frame, app: &App, area: Rect, list_state: &mut ListState) {
-    let max_fn_width = (area.width as usize).saturating_sub(36);
+    let width = area.width as usize;
 
-    let items: Vec<ListItem> = app.entries.iter().map(|entry| {
-        let (status_char, mut status_color) = match entry.status {
-            EntryStatus::Approved => ("✓", Color::Green),
-            EntryStatus::Pending  => ("~", Color::Yellow),
-            EntryStatus::Skipped  => ("s", Color::DarkGray),
-        };
-
-        let (dest_str, dest_color) = match entry.effective_destination() {
-            Destination::Existing(p) => (
-                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                Color::Green,
-            ),
-            Destination::New(name) => (format!("[NEW] {}/", name), Color::Yellow),
-            Destination::Unresolved => ("UNRESOLVED".to_string(), Color::Red),
-        };
-
-        // Unresolved pending entries get red status indicator too
-        if entry.status == EntryStatus::Pending
-            && matches!(entry.effective_destination(), Destination::Unresolved)
-        {
-            status_color = Color::Red;
-        }
-
-        let filename = entry.sort.file.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Char-safe truncation (filenames can contain Japanese etc.)
-        let filename_display = if filename.chars().count() > max_fn_width {
-            let t: String = filename.chars().take(max_fn_width.saturating_sub(1)).collect();
-            format!("{}…", t)
-        } else {
-            filename
-        };
-
-        let source_label = entry.sort.source.as_ref().map(|s| s.label()).unwrap_or("?");
-
-        ListItem::new(Line::from(vec![
-            Span::styled(format!("[{}] ", status_char), Style::default().fg(status_color)),
-            Span::raw(filename_display),
-            Span::raw(" → "),
-            Span::styled(dest_str, Style::default().fg(dest_color)),
-            Span::styled(
-                format!(" [{}]", source_label),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-    }).collect();
+    // Build one ListItem per visible row, in the exact same order as
+    // `visible_rows` — that order is what `selected` (and the highlight) indexes.
+    let items: Vec<ListItem> = app
+        .visible_rows()
+        .iter()
+        .map(|row| match *row {
+            Row::Header(gi) => header_item(app, gi, width),
+            Row::Single(ei) => file_item(app, ei, width, false),
+            Row::Child(_, ei) => file_item(app, ei, width, true),
+        })
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Screenshots "))
@@ -227,79 +201,121 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect, list_state: &mut ListState) {
     f.render_stateful_widget(list, area, list_state);
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
-    let lines = match app.entries.get(app.selected) {
-        None => vec![Line::raw("")],
-        Some(entry) => {
-            let file = &entry.sort.file;
-            let dim = Style::default().fg(Color::DarkGray);
+/// A collapsible header line for a multi-file series.
+fn header_item(app: &App, gi: usize, width: usize) -> ListItem<'static> {
+    let group = &app.groups[gi];
+    let st = app.group_status(gi);
 
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("file:    ", dim),
-                    Span::raw(
-                        file.path.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("parsed:  ", dim),
-                    Span::raw(file.title.as_deref().unwrap_or("(none)")),
-                    Span::styled(
-                        file.episode.as_ref().map(|e| format!("  ep.{}", e)).unwrap_or_default(),
-                        dim,
-                    ),
-                    Span::styled(
-                        file.release_group.as_ref()
-                            .map(|g| format!("  [{}]", g))
-                            .unwrap_or_default(),
-                        dim,
-                    ),
-                ]),
-            ];
+    let (status_char, status_color) = if st.unresolved > 0 {
+        ("!", Color::Red)
+    } else if st.approved == st.total {
+        ("✓", Color::Green)
+    } else if st.skipped == st.total {
+        ("s", Color::DarkGray)
+    } else {
+        ("~", Color::Yellow)
+    };
 
-            if let Some(al) = &entry.sort.anilist {
-                lines.push(Line::from(vec![
-                    Span::styled("anilist: ", dim),
-                    Span::styled(
-                        al.romaji.as_deref().unwrap_or("?"),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        al.english.as_ref()
-                            .map(|e| format!("  /  {}", e))
-                            .unwrap_or_default(),
-                        dim,
-                    ),
-                ]));
-            }
+    let arrow = if group.expanded { "▾" } else { "▸" };
+    let (dest_str, dest_color) = group_destination(app, gi);
+    let label = truncate_chars(&group.label, width.saturating_sub(44));
 
-            if !file.video_time.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("at:      ", dim),
-                    Span::raw(file.video_time.clone()),
-                ]));
-            }
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("[{}] ", status_char), Style::default().fg(status_color)),
+        Span::styled(format!("{} ", arrow), Style::default().fg(Color::Cyan)),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  ({})", st.total), Style::default().fg(Color::DarkGray)),
+        Span::raw(" → "),
+        Span::styled(dest_str, Style::default().fg(dest_color)),
+        Span::styled(
+            format!("  {}/{} ✓", st.approved, st.total),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+}
 
-            if let Some(src) = &entry.sort.source {
-                if let Some(matched) = src.matched_title() {
-                    lines.push(Line::from(vec![
-                        Span::styled("via:     ", dim),
-                        Span::raw(matched.to_owned()),
-                    ]));
-                }
-            }
+/// A single file row — used both for one-file series and for children under an
+/// expanded header. Children are indented and drop the destination (the header
+/// already shows it), keeping just the filename and episode.
+fn file_item(app: &App, ei: usize, width: usize, indented: bool) -> ListItem<'static> {
+    let entry = &app.entries[ei];
 
-            let (dest_str, dest_color) = match entry.effective_destination() {
-                Destination::Existing(p) => (format!("→  {}", p.display()), Color::Green),
-                Destination::New(n) => (format!("→  [CREATE] {}/", n), Color::Yellow),
-                Destination::Unresolved => ("→  not resolved".to_string(), Color::Red),
-            };
-            lines.push(Line::from(Span::styled(dest_str, Style::default().fg(dest_color))));
+    let (status_char, mut status_color) = match entry.status {
+        EntryStatus::Approved => ("✓", Color::Green),
+        EntryStatus::Pending  => ("~", Color::Yellow),
+        EntryStatus::Skipped  => ("s", Color::DarkGray),
+    };
+    if entry.status == EntryStatus::Pending
+        && matches!(entry.effective_destination(), Destination::Unresolved)
+    {
+        status_color = Color::Red;
+    }
 
-            lines
+    let filename = entry.sort.file.path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let indent = if indented { "    " } else { "" };
+    let reserve = if indented { 16 } else { 40 };
+    let filename_display = truncate_chars(&filename, width.saturating_sub(reserve));
+
+    let mut spans = vec![
+        Span::styled(format!("[{}] ", status_char), Style::default().fg(status_color)),
+        Span::raw(format!("{}{}", indent, filename_display)),
+    ];
+
+    if indented {
+        if let Some(ep) = &entry.sort.file.episode {
+            spans.push(Span::styled(format!("  ep.{}", ep), Style::default().fg(Color::DarkGray)));
         }
+    } else {
+        let (dest_str, dest_color) = match entry.effective_destination() {
+            Destination::Existing(p) => (
+                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                Color::Green,
+            ),
+            Destination::New(name) => (format!("[NEW] {}/", name), Color::Yellow),
+            Destination::Unresolved => ("UNRESOLVED".to_string(), Color::Red),
+        };
+        let source_label = entry.sort.source.as_ref().map(|s| s.label()).unwrap_or("?");
+        spans.push(Span::raw(" → "));
+        spans.push(Span::styled(dest_str, Style::default().fg(dest_color)));
+        spans.push(Span::styled(format!(" [{}]", source_label), Style::default().fg(Color::DarkGray)));
+    }
+
+    ListItem::new(Line::from(spans))
+}
+
+/// The destination a whole group resolves to (its files all share one).
+fn group_destination(app: &App, gi: usize) -> (String, Color) {
+    let ei = app.groups[gi].entry_indices[0];
+    match app.entries[ei].effective_destination() {
+        Destination::Existing(p) => (
+            p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            Color::Green,
+        ),
+        Destination::New(name) => (format!("[NEW] {}/", name), Color::Yellow),
+        Destination::Unresolved => ("UNRESOLVED".to_string(), Color::Red),
+    }
+}
+
+/// Char-safe truncation with an ellipsis (filenames can contain Japanese etc.,
+/// so we must count chars, not bytes).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if max > 1 && s.chars().count() > max {
+        let t: String = s.chars().take(max - 1).collect();
+        format!("{}…", t)
+    } else {
+        s.to_string()
+    }
+}
+
+fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+    let lines = match app.selected_row() {
+        Some(Row::Header(gi)) => group_detail_lines(app, gi),
+        Some(Row::Single(ei)) | Some(Row::Child(_, ei)) => file_detail_lines(app, ei),
+        None => vec![Line::raw("")],
     };
 
     f.render_widget(
@@ -308,6 +324,124 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+/// Detail lines for a selected group header: series, count, status breakdown,
+/// destination.
+fn group_detail_lines(app: &App, gi: usize) -> Vec<Line<'static>> {
+    let group = &app.groups[gi];
+    let st = app.group_status(gi);
+    let dim = Style::default().fg(Color::DarkGray);
+    let (dest_str, dest_color) = group_destination(app, gi);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("series:  ", dim),
+            Span::styled(group.label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("files:   ", dim),
+            Span::raw(st.total.to_string()),
+        ]),
+    ];
+
+    let first = group.entry_indices[0];
+    if let Some(al) = &app.entries[first].sort.anilist {
+        lines.push(Line::from(vec![
+            Span::styled("anilist: ", dim),
+            Span::styled(
+                al.romaji.clone().unwrap_or_else(|| "?".to_string()),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("status:  ", dim),
+        Span::styled(format!("✓ {}   ", st.approved), Style::default().fg(Color::Green)),
+        Span::styled(format!("~ {}   ", st.pending), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("s {}", st.skipped), dim),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        format!("→  {}", dest_str),
+        Style::default().fg(dest_color),
+    )));
+
+    lines
+}
+
+/// Detail lines for a selected file row.
+fn file_detail_lines(app: &App, ei: usize) -> Vec<Line<'static>> {
+    let entry = &app.entries[ei];
+    let file = &entry.sort.file;
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("file:    ", dim),
+            Span::raw(
+                file.path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("parsed:  ", dim),
+            Span::raw(file.title.clone().unwrap_or_else(|| "(none)".to_string())),
+            Span::styled(
+                file.episode.as_ref().map(|e| format!("  ep.{}", e)).unwrap_or_default(),
+                dim,
+            ),
+            Span::styled(
+                file.release_group.as_ref()
+                    .map(|g| format!("  [{}]", g))
+                    .unwrap_or_default(),
+                dim,
+            ),
+        ]),
+    ];
+
+    if let Some(al) = &entry.sort.anilist {
+        lines.push(Line::from(vec![
+            Span::styled("anilist: ", dim),
+            Span::styled(
+                al.romaji.clone().unwrap_or_else(|| "?".to_string()),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                al.english.as_ref()
+                    .map(|e| format!("  /  {}", e))
+                    .unwrap_or_default(),
+                dim,
+            ),
+        ]));
+    }
+
+    if !file.video_time.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("at:      ", dim),
+            Span::raw(file.video_time.clone()),
+        ]));
+    }
+
+    if let Some(src) = &entry.sort.source {
+        if let Some(matched) = src.matched_title() {
+            lines.push(Line::from(vec![
+                Span::styled("via:     ", dim),
+                Span::raw(matched.to_owned()),
+            ]));
+        }
+    }
+
+    let (dest_str, dest_color) = match entry.effective_destination() {
+        Destination::Existing(p) => (format!("→  {}", p.display()), Color::Green),
+        Destination::New(n) => (format!("→  [CREATE] {}/", n), Color::Yellow),
+        Destination::Unresolved => ("→  not resolved".to_string(), Color::Red),
+    };
+    lines.push(Line::from(Span::styled(dest_str, Style::default().fg(dest_color))));
+
+    lines
 }
 
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
@@ -321,7 +455,8 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
 
     let controls = Paragraph::new(Line::from(vec![
         k("↑↓"), t(" nav  "),
-        k("a"), t(" approve  "),
+        k("→←"), t(" expand  "),
+        k("a"), t(" ok  "),
         k("A"), t(" all  "),
         k("e"), t(" edit  "),
         k("s"), t(" skip  "),

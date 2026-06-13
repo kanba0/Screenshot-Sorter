@@ -29,13 +29,16 @@ fn main() -> Result<()> {
     let dest = args.dest.unwrap_or_else(|| source.clone());
 
     eprintln!("scanning {}...", source.display());
-    let screenshots = parse::find_screenshots(&source);
+    let scan = parse::find_screenshots(&source);
 
-    if screenshots.is_empty() {
+    if scan.files.is_empty() {
         eprintln!("no MPV screenshots found.");
+        if scan.unmatched > 0 {
+            eprintln!("({} image file(s) skipped — no pattern match)", scan.unmatched);
+        }
         return Ok(());
     }
-    eprintln!("found {} screenshot(s).", screenshots.len());
+    eprintln!("found {} screenshot(s).", scan.files.len());
 
     eprintln!("building folder tree from {}...", dest.display());
     let tree = matching::build_folder_tree(&dest);
@@ -43,7 +46,7 @@ fn main() -> Result<()> {
 
     eprintln!("matching...");
     let mut anilist = anilist::AniListClient::new();
-    let entries = matching::run_pipeline(screenshots, &tree, &mut anilist)?;
+    let entries = matching::run_pipeline(scan.files, &tree, &mut anilist)?;
 
     eprintln!(
         "done. {} matched, {} need new folders, {} unresolved.\n",
@@ -52,7 +55,23 @@ fn main() -> Result<()> {
         entries.iter().filter(|e| matches!(e.destination, matching::Destination::Unresolved)).count(),
     );
 
-    tui::run(entries, dest)?;
+    let summary = tui::run(entries, dest)?;
+
+    // Closing tally of everything that didn't get sorted into a folder.
+    let mut unsorted = Vec::new();
+    if scan.unmatched > 0 {
+        unsorted.push(format!("{} didn't match the pattern", scan.unmatched));
+    }
+    if summary.skipped > 0 {
+        unsorted.push(format!("{} skipped", summary.skipped));
+    }
+    if summary.pending > 0 {
+        unsorted.push(format!("{} left pending", summary.pending));
+    }
+    if !unsorted.is_empty() {
+        let total = scan.unmatched + summary.skipped + summary.pending;
+        eprintln!("{} file(s) not sorted: {}.", total, unsorted.join(", "));
+    }
 
     Ok(())
 }

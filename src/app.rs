@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::matching::{Destination, SortEntry};
+use crate::matching::{Destination, SeriesKey, SortEntry};
 
 // ── Entry status ──────────────────────────────────────────────────────────────
 
@@ -53,10 +54,46 @@ pub enum Mode {
     Done,
 }
 
+// ── Grouped view model ────────────────────────────────────────────────────────
+
+/// A set of screenshots that belong to the same series and share a destination.
+/// Holds *indices* into `App.entries` rather than the entries themselves, so the
+/// flat list stays the single source of truth and every existing operation on it
+/// keeps working unchanged.
+#[derive(Debug, Clone)]
+pub struct Group {
+    pub label: String,
+    pub entry_indices: Vec<usize>,
+    pub expanded: bool,
+}
+
+/// One visible line in the list. `selected` indexes a `Vec<Row>` built from the
+/// groups and their expansion state — see `App::visible_rows`.
+#[derive(Debug, Clone, Copy)]
+pub enum Row {
+    /// Collapsible header for a multi-file series. Payload: group index.
+    Header(usize),
+    /// A one-file series, shown as a single row. Payload: entry index.
+    Single(usize),
+    /// A file shown beneath an expanded header. Payload: (group, entry).
+    Child(usize, usize),
+}
+
+/// Aggregate status of a group's files, for the header line and detail panel.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GroupStatus {
+    pub total: usize,
+    pub approved: usize,
+    pub skipped: usize,
+    pub pending: usize,
+    pub unresolved: usize,
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
     pub entries: Vec<AppEntry>,
+    pub groups: Vec<Group>,
     pub selected: usize,
     pub mode: Mode,
     pub dest_root: PathBuf,
@@ -71,12 +108,21 @@ pub struct CommitAction {
 
 impl App {
     pub fn new(entries: Vec<SortEntry>, dest_root: PathBuf) -> Self {
-        let app_entries = entries
+        let app_entries: Vec<AppEntry> = entries
             .into_iter()
             .map(|s| AppEntry { status: EntryStatus::Pending, sort: s, custom_dest: None })
             .collect();
 
-        Self { entries: app_entries, selected: 0, mode: Mode::Normal, dest_root, message: None }
+        let groups = build_groups(&app_entries);
+
+        Self {
+            entries: app_entries,
+            groups,
+            selected: 0,
+            mode: Mode::Normal,
+            dest_root,
+            message: None,
+        }
     }
 
     // ── Navigation ────────────────────────────────────────────────────────────
@@ -88,7 +134,7 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        if self.selected + 1 < self.entries.len() {
+        if self.selected + 1 < self.visible_len() {
             self.selected += 1;
         }
     }
@@ -98,7 +144,7 @@ impl App {
     }
 
     pub fn page_down(&mut self, page: usize) {
-        self.selected = (self.selected + page).min(self.entries.len().saturating_sub(1));
+        self.selected = (self.selected + page).min(self.visible_len().saturating_sub(1));
     }
 
     pub fn jump_top(&mut self) {
@@ -106,22 +152,149 @@ impl App {
     }
 
     pub fn jump_bottom(&mut self) {
-        self.selected = self.entries.len().saturating_sub(1);
+        self.selected = self.visible_len().saturating_sub(1);
+    }
+
+    // ── Grouped view ──────────────────────────────────────────────────────────
+
+    /// The rows currently on screen, derived from the groups and their expansion
+    /// state. Recomputed on demand — cheap at this scale, and it spares us a cache
+    /// we'd have to keep in sync. `selected` is an index into this list.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (gi, g) in self.groups.iter().enumerate() {
+            // A one-file series is its own row; no point collapsing a single file.
+            if g.entry_indices.len() == 1 {
+                rows.push(Row::Single(g.entry_indices[0]));
+            } else {
+                rows.push(Row::Header(gi));
+                if g.expanded {
+                    for &ei in &g.entry_indices {
+                        rows.push(Row::Child(gi, ei));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible_rows().len()
+    }
+
+    pub fn selected_row(&self) -> Option<Row> {
+        self.visible_rows().get(self.selected).copied()
+    }
+
+    /// The entry a status/edit action targets: the entry itself for a file row, or
+    /// the group's first entry for a header (edits apply to the whole series).
+    fn selected_entry_idx(&self) -> Option<usize> {
+        match self.selected_row()? {
+            Row::Header(gi) => self.groups[gi].entry_indices.first().copied(),
+            Row::Single(ei) | Row::Child(_, ei) => Some(ei),
+        }
+    }
+
+    fn clamp_selected(&mut self) {
+        self.selected = self.selected.min(self.visible_len().saturating_sub(1));
+    }
+
+    /// Move the cursor onto a group's header row (used when collapsing from a child).
+    fn select_header(&mut self, gi: usize) {
+        if let Some(pos) = self
+            .visible_rows()
+            .iter()
+            .position(|r| matches!(r, Row::Header(g) if *g == gi))
+        {
+            self.selected = pos;
+        }
+    }
+
+    pub fn expand_selected(&mut self) {
+        if let Some(Row::Header(gi)) = self.selected_row() {
+            self.groups[gi].expanded = true;
+        }
+    }
+
+    pub fn collapse_selected(&mut self) {
+        match self.selected_row() {
+            Some(Row::Header(gi)) => self.groups[gi].expanded = false,
+            // Collapsing while sitting on a child: fold the parent and ride the
+            // cursor back up to its header so we don't land on a vanished row.
+            Some(Row::Child(gi, _)) => {
+                self.groups[gi].expanded = false;
+                self.select_header(gi);
+            }
+            _ => {}
+        }
+        self.clamp_selected();
+    }
+
+    pub fn toggle_selected(&mut self) {
+        if let Some(Row::Header(gi)) = self.selected_row() {
+            self.groups[gi].expanded = !self.groups[gi].expanded;
+            self.clamp_selected();
+        }
+    }
+
+    pub fn group_status(&self, gi: usize) -> GroupStatus {
+        let mut st = GroupStatus::default();
+        for &ei in &self.groups[gi].entry_indices {
+            let e = &self.entries[ei];
+            st.total += 1;
+            match e.status {
+                EntryStatus::Approved => st.approved += 1,
+                EntryStatus::Skipped => st.skipped += 1,
+                EntryStatus::Pending => {
+                    st.pending += 1;
+                    if !e.is_ready() {
+                        st.unresolved += 1;
+                    }
+                }
+            }
+        }
+        st
     }
 
     // ── Status changes ────────────────────────────────────────────────────────
 
     pub fn approve_selected(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.selected) {
-            if entry.is_ready() {
-                entry.status = EntryStatus::Approved;
+        match self.selected_row() {
+            // .clone() the index list so we're not borrowing self.groups while
+            // we mutate self.entries — a Vec<usize> clone is trivial.
+            Some(Row::Header(gi)) => {
+                for ei in self.groups[gi].entry_indices.clone() {
+                    self.approve_entry(ei);
+                }
             }
+            Some(Row::Single(ei)) | Some(Row::Child(_, ei)) => self.approve_entry(ei),
+            None => {}
         }
     }
 
     pub fn skip_selected(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.selected) {
-            entry.status = EntryStatus::Skipped;
+        match self.selected_row() {
+            Some(Row::Header(gi)) => {
+                for ei in self.groups[gi].entry_indices.clone() {
+                    self.skip_entry(ei);
+                }
+            }
+            Some(Row::Single(ei)) | Some(Row::Child(_, ei)) => self.skip_entry(ei),
+            None => {}
+        }
+    }
+
+    fn approve_entry(&mut self, ei: usize) {
+        if let Some(e) = self.entries.get_mut(ei) {
+            if e.is_ready() {
+                e.status = EntryStatus::Approved;
+            }
+        }
+    }
+
+    fn skip_entry(&mut self, ei: usize) {
+        if let Some(e) = self.entries.get_mut(ei) {
+            e.status = EntryStatus::Skipped;
         }
     }
 
@@ -136,10 +309,7 @@ impl App {
     // ── Editing ───────────────────────────────────────────────────────────────
 
     pub fn start_editing(&mut self) {
-        let idx = self.selected;
-        if idx >= self.entries.len() {
-            return;
-        }
+        let Some(idx) = self.selected_entry_idx() else { return };
         let current = match self.entries[idx].effective_destination() {
             Destination::Existing(p) => p
                 .strip_prefix(&self.dest_root)
@@ -260,6 +430,10 @@ impl App {
         self.entries.iter().filter(|e| e.status == EntryStatus::Pending).count()
     }
 
+    pub fn skipped_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.status == EntryStatus::Skipped).count()
+    }
+
     pub fn needs_attention_count(&self) -> usize {
         self.entries.iter().filter(|e| e.status == EntryStatus::Pending && !e.is_ready()).count()
     }
@@ -296,6 +470,52 @@ impl App {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build display groups from the flat entry list. Entries are visited in order,
+/// so groups appear in the order their first file does. Files sharing a
+/// `series_key` join the same group; entries with no key each stand alone.
+fn build_groups(entries: &[AppEntry]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut lookup: HashMap<SeriesKey, usize> = HashMap::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        match &entry.sort.series_key {
+            Some(key) => match lookup.get(key) {
+                Some(&gi) => groups[gi].entry_indices.push(i),
+                None => {
+                    lookup.insert(key.clone(), groups.len());
+                    groups.push(Group {
+                        label: group_label(entry),
+                        entry_indices: vec![i],
+                        expanded: false,
+                    });
+                }
+            },
+            None => groups.push(Group {
+                label: group_label(entry),
+                entry_indices: vec![i],
+                expanded: false,
+            }),
+        }
+    }
+    groups
+}
+
+/// A human label for a group: the parsed series title, falling back to the
+/// destination folder name, then the raw filename.
+fn group_label(entry: &AppEntry) -> String {
+    if let Some(title) = &entry.sort.file.title {
+        return title.clone();
+    }
+    match entry.effective_destination() {
+        Destination::Existing(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        Destination::New(name) => name.clone(),
+        Destination::Unresolved => entry.sort.file.anime_filename.clone(),
+    }
+}
 
 /// Convert a char index to its corresponding byte offset in a string.
 fn char_to_byte(s: &str, char_idx: usize) -> usize {

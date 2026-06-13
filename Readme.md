@@ -35,20 +35,25 @@ ssort --source ~/Pictures/Screenshots --dest ~/Pictures/Anime
 |-----|--------|
 | `↑` `↓` / `j` `k` | navigate |
 | `g` / `G` | jump to top / bottom |
-| `a` | approve selected |
+| `→` `←` / `l` `h` | expand / collapse a series group (`space` toggles) |
+| `a` | approve selected (a whole group, or one file) |
 | `A` | approve all matched entries |
-| `s` | skip selected |
+| `s` | skip selected (a whole group, or one file) |
 | `e` | edit destination folder name |
 | `c` | commit approved moves |
 | `q` | quit |
 
-editing a destination applies to all screenshots from the same series at once.
-new folders are created automatically on commit.
+screenshots from the same series are folded into one collapsible row; expand it
+to act on individual files. approving, skipping, or editing a collapsed group
+applies to every file in it. editing a destination applies to all screenshots
+from the same series at once. new folders are created automatically on commit.
 
 ## notes
 
 - only picks up files matching MPV's screenshot naming format
-  (`filename_HH.MM.SS_YYYY-MM-DD_HH.MM.SS.ext`) which is an mpv setting I use
+  (`filename_HH.MM.SS_[YYYY-MM-DD_HH.MM.SS].ext`, from the `screenshot-template`
+  in my mpv.conf) — older dotted-date / two-part-time variants are also accepted
 - AniList lookups are rate-limited to ~1 per second; a large batch of unknown
   series will take a moment
 - screenshots are never moved until you explicitly commit
+- made with the help of Claude

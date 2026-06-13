@@ -3,9 +3,13 @@ use std::path::{Path, PathBuf};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-// MPV screenshot suffix: _HH.MM.SS_YYYY-MM-DD_HH.MM.SS
+// MPV screenshot suffix, from our screenshot-template:
+//   %f_%wH.%wM.%wS_[%tY-%tm-%td_%tH.%tM.%tS]  ->  _HH.MM.SS_[YYYY-MM-DD_HH.MM.SS]
+// The wall-clock date+time is bracketed (group 0 of the template is `%f`, the
+// untouched source filename). We tolerate two legacy variants from older shots:
+// a 2-part playback time (HH.MM) and a dot-separated date (YYYY.MM.DD).
 static MPV_SUFFIX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"_(\d{2}\.\d{2}\.\d{2})_\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}$").unwrap()
+    Regex::new(r"_(\d{2}\.\d{2}(?:\.\d{2})?)_\[\d{4}[-.]\d{2}[-.]\d{2}_\d{2}\.\d{2}\.\d{2}\]$").unwrap()
 });
 static BRACKET_TAGS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\s*[\[(][^\]\)]*[\])]").unwrap()
@@ -13,15 +17,13 @@ static BRACKET_TAGS: Lazy<Regex> = Lazy::new(|| {
 static EP_SUFFIX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\s*-\s*\d+\s*$").unwrap()
 });
+// Trailing source-file extension. Includes disc-image / DVD container types
+// (iso, ifo, vob, m2ts, ts) so they don't bleed into the parsed title.
 static VIDEO_EXT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\.(mkv|mp4|avi|m4v|webm|mov)$").unwrap()
+    Regex::new(r"(?i)\.(mkv|mp4|m4v|m2ts|webm|mov|avi|iso|ifo|vob|ts|wmv|flv|mpe?g)$").unwrap()
 });
 static HEX_HASH: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"_[0-9A-Fa-f]{8}$").unwrap()
-});
-// Matches the episode separator " - 01", " - S01E02v2", etc.
-static EP_SEPARATOR: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\s+-\s+(?:[Ss]\d+)?[Ee]?\d+[vV]?\d*\b").unwrap()
 });
 static SEASON_SUFFIX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\s+S\d+$").unwrap()
@@ -42,31 +44,41 @@ pub struct ParsedFile {
     pub release_group: Option<String>,
 }
 
-pub fn find_screenshots(dir: &Path) -> Vec<ParsedFile> {
+/// Outcome of scanning a directory: the screenshots we parsed, plus a count of
+/// image files we saw but couldn't parse (no MPV pattern) — i.e. junk we skip.
+pub struct ScanResult {
+    pub files: Vec<ParsedFile>,
+    pub unmatched: usize,
+}
+
+pub fn find_screenshots(dir: &Path) -> ScanResult {
     let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return ScanResult { files: Vec::new(), unmatched: 0 };
     };
 
-    let mut results: Vec<ParsedFile> = read_dir
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
-                return None;
-            }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_lowercase)?;
-            if !IMAGE_EXTS.contains(&ext.as_str()) {
-                return None;
-            }
-            parse_screenshot(&path)
-        })
-        .collect();
+    let mut files: Vec<ParsedFile> = Vec::new();
+    let mut images_seen = 0usize;
 
-    results.sort_by(|a, b| a.path.cmp(&b.path));
-    results
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()).map(str::to_lowercase) else {
+            continue;
+        };
+        if !IMAGE_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        images_seen += 1;
+        if let Some(parsed) = parse_screenshot(&path) {
+            files.push(parsed);
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let unmatched = images_seen - files.len();
+    ScanResult { files, unmatched }
 }
 
 fn parse_screenshot(path: &Path) -> Option<ParsedFile> {
@@ -99,34 +111,21 @@ fn strip_tags(s: &str) -> String {
     s.trim().to_string()
 }
 
-/// Returns `(anitomy_input, title_hint)`.
-/// `title_hint` is the series title we isolated ourselves — preferred over
-/// anitomy's output because the Rust port can bleed episode tokens into titles.
-fn preprocess_for_anitomy(s: &str) -> (String, Option<String>) {
+/// Strip the source extension, the release-group hex hash, and turn `_`
+/// separators into spaces so anitomy sees a clean `[Group] Title - ep` string.
+/// Our screenshot-template keeps the original brackets, so anitomy can take it
+/// from here — no manual title reconstruction needed.
+fn preprocess_for_anitomy(s: &str) -> String {
     let s = VIDEO_EXT.replace(s, "");
     let s = HEX_HASH.replace(s.trim_end(), "");
     let s = s.replace('_', " ");
-    let s = s.trim().to_string();
-
-    if !s.contains('[') && !s.contains('(') {
-        if let Some(ep_match) = EP_SEPARATOR.find(&s) {
-            let prefix = s[..ep_match.start()].trim();
-            let ep_token = &s[ep_match.start()..ep_match.end()];
-            if let Some(space) = prefix.find(' ') {
-                let group = &prefix[..space];
-                let title = prefix[space + 1..].trim().to_string();
-                let anitomy_input = format!("[{}] {}{}", group, &title, ep_token);
-                return (anitomy_input, Some(title));
-            }
-        }
-    }
-    (s, None)
+    s.trim().to_string()
 }
 
 fn parse_with_anitomy(filename: &str) -> (Option<String>, Option<String>, Option<String>) {
     use anitomy::{Anitomy, ElementCategory};
 
-    let (preprocessed, title_hint) = preprocess_for_anitomy(filename);
+    let preprocessed = preprocess_for_anitomy(filename);
     let mut anitomy = Anitomy::new();
     let anitomy_input = if preprocessed.contains('.') {
         preprocessed.clone()
@@ -138,11 +137,9 @@ fn parse_with_anitomy(filename: &str) -> (Option<String>, Option<String>, Option
         Ok(e) | Err(e) => e,
     };
 
-    // title_hint (our own extraction) is more reliable than anitomy for MPV-style
-    // names. For normal bracket-format names, title_hint is None and we use anitomy.
+    // anitomy gives us the title; fall back to bracket-stripping if it bails.
     // Either way, strip trailing season indicators (S2, S3…) so AniList can find them.
-    let title = title_hint
-        .or_else(|| elements.get(ElementCategory::AnimeTitle).map(str::to_owned))
+    let title = elements.get(ElementCategory::AnimeTitle).map(str::to_owned)
         .or_else(|| {
             let cleaned = strip_tags(&preprocessed);
             if cleaned.is_empty() { None } else { Some(cleaned) }

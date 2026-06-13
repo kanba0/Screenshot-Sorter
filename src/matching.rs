@@ -8,6 +8,10 @@ use crate::parse::ParsedFile;
 
 const FUZZY_THRESHOLD: f64 = 0.88;
 const HIGH_CONFIDENCE: f64 = 0.94;
+// Score handed to a token-prefix containment match. Above FUZZY_THRESHOLD so it
+// wins, below HIGH_CONFIDENCE so it surfaces as `fuzzy~` (please-review) — a
+// folder being a prefix of the title is strong, but not "don't even look" sure.
+const CONTAINMENT_SCORE: f64 = 0.90;
 const ANILIST_DELAY_MS: u64 = 700;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -223,10 +227,35 @@ fn match_in_tree_anilist(title: &str, tree: &FolderTree) -> Option<(PathBuf, Mat
 fn best_fuzzy(norm: &str, tree: &FolderTree) -> Option<(PathBuf, f64)> {
     tree.entries
         .iter()
-        .map(|e| (&e.path, jaro_winkler(norm, &e.normalized)))
+        .map(|e| (&e.path, match_score(norm, &e.normalized)))
         .filter(|(_, score)| *score >= FUZZY_THRESHOLD)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(path, score)| (path.clone(), score))
+}
+
+/// Similarity of a normalized title to a folder name. Jaro-Winkler, but lifted
+/// to CONTAINMENT_SCORE when one is a token-prefix of the other — that case
+/// (folder "acca" vs title "acca 13 ku kansatsu ka") is a real match that
+/// raw Jaro-Winkler underrates because of the large length difference.
+fn match_score(title: &str, folder: &str) -> f64 {
+    let jw = jaro_winkler(title, folder);
+    if is_token_prefix(title, folder) {
+        jw.max(CONTAINMENT_SCORE)
+    } else {
+        jw
+    }
+}
+
+/// True when the shorter of the two space-separated token lists is a prefix of
+/// the longer (either direction). Guards against single-character noise by
+/// requiring the shorter side to carry at least two characters.
+fn is_token_prefix(a: &str, b: &str) -> bool {
+    let a: Vec<&str> = a.split(' ').filter(|t| !t.is_empty()).collect();
+    let b: Vec<&str> = b.split(' ').filter(|t| !t.is_empty()).collect();
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    !short.is_empty()
+        && short.iter().map(|t| t.len()).sum::<usize>() >= 2
+        && short.iter().zip(long.iter()).all(|(x, y)| x == y)
 }
 
 pub fn normalize(s: &str) -> String {
